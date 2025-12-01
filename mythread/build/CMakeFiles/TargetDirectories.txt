@@ -1,3 +1,0 @@
-/home/weolence/desktop/OS/mythread/build/CMakeFiles/mythread.dir
-/home/weolence/desktop/OS/mythread/build/CMakeFiles/edit_cache.dir
-/home/weolence/desktop/OS/mythread/build/CMakeFiles/rebuild_cache.dir

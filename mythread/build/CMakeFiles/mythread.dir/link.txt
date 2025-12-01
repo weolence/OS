@@ -1,1 +1,0 @@
-/usr/sbin/cc  -std=gnu11 -Wall -Wextra -g -fsanitize=address -fsanitize=leak -Wl,--dependency-file=CMakeFiles/mythread.dir/link.d CMakeFiles/mythread.dir/src/main.c.o CMakeFiles/mythread.dir/src/mythread.c.o -o mythread  -lpthread
