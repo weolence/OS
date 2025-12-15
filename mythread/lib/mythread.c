@@ -39,8 +39,6 @@ typedef struct thread_data {
 } thread_data;
 
 static thread_data *threads_head = NULL;
-static atomic_int reaper_created = ATOMIC_VAR_INIT(FALSE);
-static atomic_int reaper_notified = ATOMIC_VAR_INIT(FALSE);
 static atomic_flag lock = ATOMIC_FLAG_INIT;
 
 // mutex 
@@ -99,7 +97,7 @@ static void threads_remove(thread_data *tdata) {
 }
 
 // cleanup functions
-static void cleanup_stack_run(thread_data *tdata) {
+static void cleanup_thread(thread_data *tdata) {
     cleanup_node *curr = tdata->cleanup_stack;
     while (curr) {
         cleanup_node *next = curr->next;
@@ -110,84 +108,13 @@ static void cleanup_stack_run(thread_data *tdata) {
     tdata->cleanup_stack = NULL;
 }
 
-static void cleanup_stack_free(thread_data *tdata) {
+static void cleanup_free(thread_data *tdata) {
     cleanup_node *curr = tdata->cleanup_stack;
     while (curr) {
         cleanup_node *next = curr->next;
         free(curr);
         curr = next;
     }
-}
-
-// reaper functions
-static int reaper_cycle(void *args) {
-    while (TRUE) {
-        while (!atomic_load(&reaper_notified)) {
-            futex_wait((int *)&reaper_notified, FALSE);
-        }
-        atomic_store(&reaper_notified, FALSE);
-        flag_lock();
-        thread_data *prev = NULL;
-        thread_data *curr = threads_head;
-        while (curr) {
-            if (!atomic_load(&curr->finished)) {
-                prev = curr;
-                curr = curr->next;
-                continue;
-            }
-            if (atomic_load(&curr->joined)) {
-                prev = curr;
-                curr = curr->next;
-                continue;
-            }
-            if (curr->memory) {
-                munmap(curr->memory, curr->memory_size);
-            }
-            if (prev) prev->next = curr->next;
-            else threads_head = curr->next;
-
-            cleanup_stack_free(curr);
-            free(curr);
-
-            curr = prev ? prev->next : threads_head;
-        }
-        flag_unlock();
-    }
-    return EXIT_SUCCESS;
-}
-
-static void reaper_ensure(void) {
-    if (atomic_load(&reaper_created)) return;
-    flag_lock();
-    if (!atomic_load(&reaper_created)) {
-        size_t page = sysconf(_SC_PAGESIZE);
-        size_t total = STACK_SIZE + page;
-        void *memory = mmap(NULL, total, PROT_READ | PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
-        if (memory == MAP_FAILED) {
-            perror("mmap for reaper stack failed");
-        } else {
-            if (mprotect(memory, page, PROT_NONE) != 0) {
-                perror("mprotect guard page");
-                munmap(memory, total);
-            } else {
-                void *stack_top = (char*)memory + total;
-                int flags = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD;
-                int rt = clone(reaper_cycle, stack_top, flags | SIGCHLD, NULL);
-                if (rt == -1) {
-                    perror("clone reaper failed");
-                    munmap(memory, total);
-                } else {
-                    atomic_store(&reaper_created, TRUE);
-                }
-            }
-        }
-    }
-    flag_unlock();
-}
-
-static void reaper_notify(void) {
-    atomic_store(&reaper_notified, TRUE);
-    futex_wake((int *)&reaper_notified, 1);
 }
 
 // mythread realization
@@ -208,8 +135,7 @@ static int thread_execute(void *args) {
 
     mythread_exit(retval);
 
-    syscall(SYS_exit, EXIT_SUCCESS);
-    return EXIT_SUCCESS;
+    __builtin_unreachable();
 }
 
 int mythread_create(mythread_t *thread, void *(*start_routine)(void *), void *arg) {
@@ -217,8 +143,6 @@ int mythread_create(mythread_t *thread, void *(*start_routine)(void *), void *ar
         errno = EINVAL;
         return EXIT_FAILURE;
     }
-
-    reaper_ensure();
 
     size_t page = sysconf(_SC_PAGESIZE);
     size_t total = STACK_SIZE + page;
@@ -291,17 +215,41 @@ void mythread_exit(void *retval) {
         syscall(SYS_exit, 0);
     }
 
-    cleanup_stack_run(tdata);
+    cleanup_thread(tdata);
 
     tdata->retval = retval;
 
     atomic_store(&tdata->finished, TRUE);
     futex_wake((int *)&tdata->finished, 1);
 
-    if(atomic_load(&tdata->detached))
-        reaper_notify();
+    if (atomic_load(&tdata->detached)) {
+        void *memory = tdata->memory;
+        size_t memory_size = tdata->memory_size;
 
-    syscall(SYS_exit, 0);
+        threads_remove(tdata);
+        cleanup_free(tdata);
+        free(tdata);
+        
+        __asm__ volatile (
+            // munmap(memory, memory_size)
+            "movq $11, %%rax\n\t"    // SYS_munmap = 11
+            "movq %0, %%rdi\n\t"     // memory
+            "movq %1, %%rsi\n\t"     // memory_size
+            "syscall\n\t"
+            
+            // exit(0)
+            "movq $60, %%rax\n\t"    // SYS_exit
+            "xorq %%rdi, %%rdi\n\t"  // exit code 0
+            "syscall\n\t"
+            :
+            : "r"(memory), "r"(memory_size)
+            : "rax", "rdi", "rsi", "rcx", "r11"
+        );
+    } else {
+        syscall(SYS_exit, 0);
+    }
+    
+    __builtin_unreachable();
 }
 
 mythread_t mythread_self(void) {
@@ -336,6 +284,7 @@ int mythread_join(mythread_t thread, void **retval) {
         }
         curr = curr->next;
     }
+
     if (!tdata) {
         flag_unlock();
         perror("during join thread data lost");
@@ -360,12 +309,6 @@ int mythread_join(mythread_t thread, void **retval) {
     if (retval) *retval = tdata->retval;
 
     threads_remove(tdata);
-
-    if (tdata->memory) {
-        munmap(tdata->memory, tdata->memory_size);
-    }
-
-    cleanup_stack_free(tdata);
 
     free(tdata);
 
@@ -407,10 +350,6 @@ int mythread_detach(mythread_t thread) {
     atomic_store(&tdata->detached, TRUE);
     flag_unlock();
 
-    if (atomic_load(&tdata->finished)) {
-        reaper_notify();
-    }
-
     return 0;
 }
 
@@ -439,10 +378,7 @@ void mythread_testcancel(void) {
         tdata->retval = (void*)PTHREAD_CANCELED;
         atomic_store(&tdata->finished, TRUE);
         futex_wake((int *)(&tdata->finished), INT_MAX);
-        // if (atomic_load(&tdata->detached)) {
-        //     reaper_notify();
-        // }
-        syscall(SYS_exit, 0);
+        mythread_exit(tdata->retval);
     }
 }
 
