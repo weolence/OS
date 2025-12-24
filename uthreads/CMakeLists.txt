@@ -7,7 +7,8 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 include_directories(${CMAKE_SOURCE_DIR}/lib)
 
 add_executable(uthreads
-    src/main1.c
+    src/main.c
     lib/uthreads.c
-    lib/uthreads_wrappers.c
+    lib/thread_local_storage.c
+    lib/uthreads_queue.c
 )

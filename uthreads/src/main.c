@@ -3,11 +3,12 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <unistd.h>
+#include <pthread.h>
 
 static void *println_test(void *arg) {
     int id = (int)(long)arg;
     for (int i = 0; i < 3; i++) {
-        printf("[uthread %d] i = %d\n", id, i);
+        printf("[pthread %u][uthread %d] i = %d\n", pthread_self(), id, i);
         uthread_yield();
     }
     sleep(3);
@@ -15,7 +16,7 @@ static void *println_test(void *arg) {
 }
 
 int main(void) {
-    if (uthreads_init() != EXIT_SUCCESS) {
+    if (uthreads_init(2) != EXIT_SUCCESS) {
         fprintf(stderr, "uthreads_init failed\n");
         return 1;
     }
@@ -24,7 +25,7 @@ int main(void) {
     uthread_create(&println_uth1, println_test, (void *)(long)1);
     uthread_create(&println_uth2, println_test, (void *)(long)2);
 
-    uthread_run();
+    uthreads_run();
   
     long println_uth1_res = (long)uthread_join(&println_uth1);
     long println_uth2_res = (long)uthread_join(&println_uth2);
@@ -33,7 +34,7 @@ int main(void) {
     printf("println_test_uthread1 returned %ld\n", println_uth1_res);
     printf("println_test_uthread2 returned %ld\n", println_uth2_res);
 
-    uthread_system_shutdown();
+    uthreads_system_shutdown();
 
     return 0;
 }

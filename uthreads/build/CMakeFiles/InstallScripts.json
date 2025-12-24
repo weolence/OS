@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"/home/weolence/desktop/OS/uthreads/build/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

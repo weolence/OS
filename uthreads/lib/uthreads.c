@@ -1,187 +1,362 @@
 #include "uthreads.h"
+#include "uthreads_queue.h"
+#include "thread_local_storage.h"
 
-#include <stdio.h>
-#include <stdlib.h>
 #include <ucontext.h>
+#include <stdlib.h>
 #include <errno.h>
-
-#define UTHREADS_LIMIT 128
-#define STACK_SIZE (1024 * 1024)
+#include <error.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <stdio.h>
 
 enum {
     FALSE = 0,
     TRUE = 1,
 };
 
-/* ----- uthreads storage (queue) ----- */
-static size_t head_index = 0;
-static size_t curr_index = 0;
-static uthread_t *queue[UTHREADS_LIMIT];
+#define STACK_SIZE 1024 * 1024
 
-static int queue_push(uthread_t *thread) {
-    if (head_index >= UTHREADS_LIMIT || !thread) {
-        return EXIT_FAILURE;
+static atomic_int uthreads_initialized = FALSE;
+static atomic_int uthreads_started = FALSE;
+
+static tlocal_t *storage_main_context = NULL;
+static tlocal_t *storage_exit_context = NULL;
+static tlocal_t *storage_uthreads_queue = NULL;
+static tlocal_t *storage_curr_uthread = NULL;
+
+static pthread_t *threads = NULL;
+static size_t threads_size = 0;
+static atomic_size_t threads_index = 0;
+
+/* ===== utility functions ===== */
+
+void uthread_exit_routine(void) {
+    pthread_t self = pthread_self();
+    uthread_t *uthread = tlocal_get(storage_curr_uthread, self);
+    if (uthread) {
+        // after end of uthread execution it's stack freed,
+        // but struct uthread_t still alive because of retval value
+        if (uthread->stack) {
+            free(uthread->stack);
+            uthread->stack = NULL;
+        }
+        uthread->finished = TRUE;
     }
-    queue[head_index++] = thread;
-    return EXIT_SUCCESS;
+    ucontext_t *main_context = tlocal_get(storage_main_context, self);
+    setcontext(main_context);
 }
 
-static uthread_t* queue_peek_next_valid(void) {
-    if (head_index == 0) return NULL;
-    size_t scanned = 0;
-    while (scanned < head_index) {
-        curr_index = (curr_index + 1) % head_index;
-        uthread_t *t = queue[curr_index];
-        scanned++;
-        if (t && !t->finished) return t;
-    }
-    return NULL;
-}
-
-static void queue_clear(void) {
-    head_index = 0;
-    curr_index = 0;
-    for (size_t i = 0; i < UTHREADS_LIMIT; i++) {
-        queue[i] = NULL;
-    }
-}
-
-static int queue_is_full(void) {
-    return head_index >= UTHREADS_LIMIT;
-}
-
-/* ----- uthreads realization ----- */
-static ucontext_t main_context, exit_context;
-static void *exit_stack = NULL;
-static uthread_t *curr_thread = NULL;
-static int uthreads_initialized = FALSE;
-
-void thread_routine(void) {
-    if (curr_thread && curr_thread->start_routine) {
-        uthread_exit(curr_thread->start_routine(curr_thread->arg));
+void uthread_routine(void) {
+    pthread_t self = pthread_self();
+    uthread_t *uthread = tlocal_get(storage_curr_uthread, self);
+    if (uthread && uthread->start_routine) {
+        uthread_exit(uthread->start_routine(uthread->arg));
     } else {
         uthread_exit(NULL);
     }
 }
 
-void exit_routine(void) {
-    if (curr_thread) {
-        if (curr_thread->stack) {
-            free(curr_thread->stack);
-            curr_thread->stack = NULL;
-        }
-        curr_thread->finished = 1;
+void *pthread_routine(void *arg) {
+    uthreads_queue_t *uthreads_queue = uthreads_queue_create();
+    if (!uthreads_queue) {
+        errno = ENOMEM;
+        perror("pthread_routine");
+        return NULL;
     }
-    setcontext(&main_context);
+
+    ucontext_t *main_context = calloc(1, sizeof(ucontext_t));
+    if (!main_context) {
+        uthreads_queue_destroy(uthreads_queue);
+        errno = ENOMEM;
+        perror("pthread_routine");
+        return NULL;
+    }
+
+    if (getcontext(main_context) == -1) {
+        uthreads_queue_destroy(uthreads_queue);
+        free(main_context);
+        errno = ENODATA;
+        perror("pthread_routine");
+        return NULL;
+    }
+
+    ucontext_t *exit_context = calloc(1, sizeof(ucontext_t));
+    if (!exit_context) {
+        uthreads_queue_destroy(uthreads_queue);
+        free(main_context);
+        errno = ENOMEM;
+        perror("pthread_routine");
+        return NULL;
+    }
+    
+    if (getcontext(exit_context) == -1) {
+        uthreads_queue_destroy(uthreads_queue);
+        free(main_context);
+        free(exit_context);
+        errno = ENODATA;
+        perror("pthread_routine");
+        return NULL;
+    }
+
+    void *exit_stack = malloc(STACK_SIZE);
+    if (!exit_stack) {
+        uthreads_queue_destroy(uthreads_queue);
+        free(main_context);
+        free(exit_context);
+        errno = ENOMEM;
+        perror("pthread_routine");
+        return NULL;
+    }
+
+    exit_context->uc_stack.ss_sp = exit_stack;
+    exit_context->uc_stack.ss_size = STACK_SIZE;
+    exit_context->uc_stack.ss_flags = 0;
+    exit_context->uc_link = main_context;
+    makecontext(exit_context, uthread_exit_routine, 0);
+
+    pthread_t self = pthread_self();
+
+    tlocal_set(storage_uthreads_queue, self, uthreads_queue);
+    tlocal_set(storage_exit_context, self, exit_context);
+    tlocal_set(storage_main_context, self, main_context);
+
+    while (!atomic_load(&uthreads_started)) { }
+
+    while (TRUE) {
+        pthread_t self = pthread_self();
+
+        uthread_t *curr_uthread = tlocal_get(storage_curr_uthread, self);
+
+        // put executed earlier uthread.
+        // if this uthread finished, it will not get into uthreads_queue.
+        // struct of this thread will be freed only after joining it
+        if (curr_uthread && !curr_uthread->finished) {
+            uthreads_queue_add(uthreads_queue, curr_uthread);
+        }
+
+        // get next uthread from queue
+        uthread_t *next_uthread = uthreads_queue_get(uthreads_queue);
+        if (!next_uthread) {
+            break; // no uthreads for executing
+        }
+
+        // set next uthread as current
+        tlocal_set(storage_curr_uthread, self, next_uthread);
+
+        // swap to next uthread context
+        ucontext_t *main_context = tlocal_get(storage_main_context, self);
+        swapcontext(main_context, &next_uthread->context);
+    }
+
+    return NULL;
 }
 
-int uthreads_init(void) {
-    if (uthreads_initialized) {
+/* ===== end of utility functions ===== */
+
+int uthreads_init(size_t kernel_threads_num) {
+    if (atomic_load(&uthreads_initialized)) {
         return EXIT_SUCCESS;
     }
 
-    if (getcontext(&exit_context) == -1) {
+    threads_size = kernel_threads_num;
+    threads = calloc(threads_size, sizeof(pthread_t));
+    if (!threads) {
+        errno = ENOMEM;
+        perror("uthreads_init");
         return EXIT_FAILURE;
     }
 
-    exit_stack = malloc(STACK_SIZE);
-    if (!exit_stack) {
+    // creating tls of queues (every thread will have it own queue)
+    storage_uthreads_queue = tlocal_create(threads_size);
+    if (!storage_uthreads_queue) {
+        free(threads);
+        errno = ENOMEM;
+        perror("uthreads_init");
         return EXIT_FAILURE;
     }
 
-    exit_context.uc_stack.ss_sp = exit_stack;
-    exit_context.uc_stack.ss_size = STACK_SIZE;
-    exit_context.uc_stack.ss_flags = 0;
-    exit_context.uc_link = &main_context;
-    makecontext(&exit_context, (void (*)(void))exit_routine, 0);
+    // creating tls of main contexts (every thread will have it own main context)
+    storage_main_context = tlocal_create(threads_size);
+    if (!storage_main_context) {
+        free(threads);
+        tlocal_destroy(storage_uthreads_queue);
+        errno = ENOMEM;
+        perror("uthreads_init");
+        return EXIT_FAILURE;
+    }
 
-    queue_clear();
-    curr_thread = NULL;
-    uthreads_initialized = TRUE;
+    // creating tls of exit contexts (every thread will have it own exit context)
+    storage_exit_context = tlocal_create(threads_size);
+    if (!storage_exit_context) {
+        free(threads);
+        tlocal_destroy(storage_uthreads_queue);
+        tlocal_destroy(storage_main_context);
+        errno = ENOMEM;
+        perror("uthreads_init");
+        return EXIT_FAILURE;
+    }
+
+    storage_curr_uthread = tlocal_create(threads_size);
+    if (!storage_curr_uthread) {
+        free(threads);
+        tlocal_destroy(storage_uthreads_queue);
+        tlocal_destroy(storage_main_context);
+        tlocal_destroy(storage_exit_context);
+        errno = ENOMEM;
+        perror("uthreads_init");
+        return EXIT_FAILURE;
+    }
+
+    for (size_t i = 0; i < threads_size; i++) {
+        pthread_t thread;
+        pthread_create(&thread, NULL, pthread_routine, NULL);
+        threads[i] = thread;
+    }
+
+    atomic_store(&uthreads_initialized, TRUE);
 
     return EXIT_SUCCESS;
 }
 
-void uthread_system_shutdown(void) {
-    if (!uthreads_initialized) return;
-
-    if (exit_stack) {
-        free(exit_stack);
-        exit_stack = NULL;
-    }
-
-    uthreads_initialized = 0;
-}
-
-int uthread_create(uthread_t *thread, void *(*start_routine)(void *), void *arg) {
-    if (!uthreads_initialized || !thread || !start_routine) {
+int uthread_create(uthread_t *uthread, void *(*start_routine)(void *), void *arg) {
+    if (!atomic_load(&uthreads_initialized) || !uthread || !start_routine) {
         errno = EINVAL;
+        perror("uthread_create");
         return EXIT_FAILURE;
     }
 
-    if (queue_is_full()) {
-        errno = EAGAIN;
+    if (getcontext(&uthread->context) == -1) {
+        errno = ENODATA;
+        perror("uthread_create");
         return EXIT_FAILURE;
     }
 
-    if (getcontext(&thread->context) == -1) {
+    uthread->stack = malloc(STACK_SIZE);
+    if (!uthread->stack) {
+        errno = ENOMEM;
+        perror("uthread_create");
         return EXIT_FAILURE;
     }
 
-    thread->stack = malloc(STACK_SIZE);
-    if (!thread->stack) {
-        return EXIT_FAILURE;
+    size_t index = atomic_load(&threads_index);
+    atomic_store(&threads_index, (index + 1) % threads_size);
+    pthread_t pthread = threads[index]; // thread will receive task through queue
+
+    // have to wait until pthread_routine initialize uthreads_queue for thread
+    uthreads_queue_t *uthreads_queue = NULL;
+    while (!uthreads_queue) {
+        uthreads_queue = tlocal_get(storage_uthreads_queue, pthread);
     }
 
-    thread->context.uc_stack.ss_sp = thread->stack;
-    thread->context.uc_stack.ss_size = STACK_SIZE;
-    thread->context.uc_stack.ss_flags = 0;
-    thread->context.uc_link = &exit_context;
+    // have to wait until pthread_routine initialize exit_context for thread
+    ucontext_t *exit_context = NULL;
+    while (!exit_context) {
+        exit_context = tlocal_get(storage_exit_context, pthread);
+    }
 
-    thread->start_routine = start_routine;
-    thread->arg = arg;
-    thread->finished = 0;
-    thread->retval = NULL;
+    uthread->context.uc_stack.ss_sp = uthread->stack;
+    uthread->context.uc_stack.ss_size = STACK_SIZE;
+    uthread->context.uc_stack.ss_flags = 0;
+    uthread->context.uc_link = exit_context;
 
-    makecontext(&thread->context, (void (*)(void))thread_routine, 0);
+    uthread->start_routine = start_routine;
+    uthread->arg = arg;
+    uthread->finished = 0;
+    uthread->retval = NULL;
 
-    queue_push(thread);
+    makecontext(&uthread->context, (void (*)(void))uthread_routine, 0);
+
+    uthreads_queue_add(uthreads_queue, uthread);
 
     return EXIT_SUCCESS;
 }
 
-void uthread_run(void) {
-    if (!uthreads_initialized) return;
-    while (TRUE) {
-        uthread_t *next = queue_peek_next_valid();
-        if (!next) {
-            break;
-        }
-        curr_thread = next;
-        swapcontext(&main_context, &curr_thread->context);
+void uthreads_run(void) {
+    if (!atomic_load(&uthreads_initialized) || atomic_load(&uthreads_started)) {
+        return;
     }
-    curr_thread = NULL;
+    atomic_store(&uthreads_started, TRUE);
 }
 
 void uthread_yield(void) {
-    if (curr_thread && !curr_thread->finished) {
-        swapcontext(&curr_thread->context, &main_context);
+    pthread_t self = pthread_self();
+    uthread_t *uthread = tlocal_get(storage_curr_uthread, self);
+    if (uthread && !uthread->finished) {
+        ucontext_t *main_context = tlocal_get(storage_main_context, self);
+        swapcontext(&uthread->context, main_context);
     }
 }
 
 void uthread_exit(void *retval) {
-    if (!curr_thread) {
-        setcontext(&main_context);
-        return;
+    pthread_t self = pthread_self();
+    uthread_t *uthread = tlocal_get(storage_curr_uthread, self);
+    if (!uthread) {
+        ucontext_t *main_context = tlocal_get(storage_main_context, self);
+        setcontext(main_context);
+    } else {
+        uthread->retval = retval;
+        ucontext_t *exit_context = tlocal_get(storage_exit_context, self);
+        setcontext(exit_context);
     }
-    curr_thread->retval = retval;
-    setcontext(&exit_context);
 }
 
-void *uthread_join(uthread_t *thread) {
-    if (!thread) return NULL;
-    while (!thread->finished) {
-        uthread_yield();
+void *uthread_join(uthread_t *uthread) {
+    if (!uthread) {
+        errno = EINVAL;
+        perror("uthread_join");
+        return NULL;
     }
-    return thread->retval;
+    while (!uthread->finished) {
+        sched_yield();
+    }
+    return uthread->retval;
+}
+
+void uthreads_system_shutdown(void) {
+    if (!atomic_load(&uthreads_initialized)) {
+        return;
+    }
+
+    for(size_t i = 0; i < threads_size; i++) {
+        pthread_t pthread = threads[i];
+        pthread_join(pthread, NULL);
+
+        ucontext_t *main_context = tlocal_remove(storage_main_context, pthread);
+        if (main_context) {
+            free(main_context);
+        }
+
+        ucontext_t *exit_context = tlocal_remove(storage_exit_context, pthread);
+        if (exit_context) {
+            if (exit_context->uc_stack.ss_sp) {
+                free(exit_context->uc_stack.ss_sp);
+                exit_context->uc_stack.ss_sp = NULL;
+            }
+            free(exit_context);
+        }
+
+        uthreads_queue_t *uthreads_queue = tlocal_remove(storage_uthreads_queue, pthread);
+        uthreads_queue_destroy(uthreads_queue);
+
+        uthread_t *curr_uthread = tlocal_remove(storage_curr_uthread, pthread);
+        if(curr_uthread) {
+            if (curr_uthread->stack) {
+                free(curr_uthread->stack);
+                curr_uthread->stack = NULL;
+            }
+        }
+    }
+
+    tlocal_destroy(storage_main_context);
+    tlocal_destroy(storage_exit_context);
+    tlocal_destroy(storage_uthreads_queue);
+    tlocal_destroy(storage_curr_uthread);
+
+    free(threads);
+    threads_size = 0;
+    atomic_store(&threads_index, 0);
+
+    atomic_store(&uthreads_started, FALSE);
+    atomic_store(&uthreads_initialized, FALSE);
 }
