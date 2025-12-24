@@ -3,8 +3,7 @@
 #include <stdatomic.h>
 
 typedef struct {
-    atomic_int lock;
-    int owner_tid;
+    atomic_uint owner_tid;
 } mutex_t;
 
 void mutex_init(mutex_t *mutex);
