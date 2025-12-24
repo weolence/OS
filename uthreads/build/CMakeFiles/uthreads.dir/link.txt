@@ -1,1 +1,0 @@
-/usr/sbin/cc -Wl,--dependency-file=CMakeFiles/uthreads.dir/link.d CMakeFiles/uthreads.dir/src/main.c.o CMakeFiles/uthreads.dir/lib/uthreads.c.o CMakeFiles/uthreads.dir/lib/thread_local_storage.c.o CMakeFiles/uthreads.dir/lib/uthreads_queue.c.o -o uthreads

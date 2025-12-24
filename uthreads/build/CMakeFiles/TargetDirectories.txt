@@ -1,3 +1,0 @@
-/home/weolence/desktop/OS/uthreads/build/CMakeFiles/uthreads.dir
-/home/weolence/desktop/OS/uthreads/build/CMakeFiles/edit_cache.dir
-/home/weolence/desktop/OS/uthreads/build/CMakeFiles/rebuild_cache.dir
