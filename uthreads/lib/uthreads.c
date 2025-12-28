@@ -9,6 +9,7 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
+#include <stdarg.h>
 
 enum {
     FALSE = 0,
@@ -219,12 +220,32 @@ int uthreads_init(size_t kernel_threads_num) {
     return EXIT_SUCCESS;
 }
 
-int uthread_create(uthread_t *uthread, void *(*start_routine)(void *), void *arg) {
+int uthread_create(uthread_t *uthread, void *(*start_routine)(void *), void *arg, ...) {
     if (!atomic_load(&uthreads_initialized) || !uthread || !start_routine) {
         errno = EINVAL;
         perror("uthread_create");
         return EXIT_FAILURE;
     }
+
+    va_list args;
+    va_start(args, arg);
+    size_t *opt_index_ptr = va_arg(args, size_t *);
+    size_t index = 0;
+    
+    if (opt_index_ptr) {
+        if (*opt_index_ptr >= threads_size) {
+            errno = EINVAL;
+            perror("uthread_create");
+            return EXIT_FAILURE;
+        }
+        index = *opt_index_ptr;
+    } else {
+        index = atomic_load(&threads_index);
+        atomic_store(&threads_index, (index + 1) % threads_size);
+    }
+    pthread_t pthread = threads[index]; // thread will receive task through queue
+
+    va_end(args);
 
     if (getcontext(&uthread->context) == -1) {
         errno = ENODATA;
@@ -238,10 +259,6 @@ int uthread_create(uthread_t *uthread, void *(*start_routine)(void *), void *arg
         perror("uthread_create");
         return EXIT_FAILURE;
     }
-
-    size_t index = atomic_load(&threads_index);
-    atomic_store(&threads_index, (index + 1) % threads_size);
-    pthread_t pthread = threads[index]; // thread will receive task through queue
 
     // have to wait until pthread_routine initialize uthreads_queue for thread
     uthreads_queue_t *uthreads_queue = NULL;
@@ -302,7 +319,7 @@ void uthread_exit(void *retval) {
 }
 
 void *uthread_join(uthread_t *uthread) {
-    if (!uthread) {
+    if (!uthread || !uthread->start_routine) {
         errno = EINVAL;
         perror("uthread_join");
         return NULL;
