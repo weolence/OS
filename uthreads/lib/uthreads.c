@@ -155,12 +155,12 @@ void *pthread_routine(void *arg) {
 
 /* ===== end of utility functions ===== */
 
-int uthreads_init(size_t kernel_threads_num) {
+int uthreads_init(size_t pthreads_num) {
     if (atomic_load(&uthreads_initialized)) {
         return EXIT_SUCCESS;
     }
 
-    threads_size = kernel_threads_num;
+    threads_size = pthreads_num;
     threads = calloc(threads_size, sizeof(pthread_t));
     if (!threads) {
         errno = ENOMEM;

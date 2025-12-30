@@ -23,8 +23,8 @@ int main(void) {
 
     size_t queue0 = 0, queue1 = 1;
     uthread_t println_uth1, println_uth2;
-    uthread_create(&println_uth1, println_test, (void *)(long)1, queue0);
-    uthread_create(&println_uth2, println_test, (void *)(long)2, queue1);
+    uthread_create(&println_uth1, println_test, (void *)(long)1, &queue0);
+    uthread_create(&println_uth2, println_test, (void *)(long)2, &queue1);
 
     uthreads_run();
   
